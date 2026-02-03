@@ -1,6 +1,5 @@
 import time
 import requests
-import subprocess
 import json
 import sys
 import os
@@ -20,8 +19,11 @@ MOLTBOOK_API_KEY = "YOUR_MOLTBOOK_API_KEY_HERE"
 AGENT_NAME = "YOUR_AGENT_NAME" # e.g. Root_of_Trust_05
 
 # --- ENDPOINTS ---
-BASE_URL = "https://www.moltbook.com/api/v1"
+BASE_URL = "https://moltbook.com/api/v1"
 MODEL_NAME = "gemini-2.5-pro" 
+
+# --- PACING ---
+GLOBAL_COOLDOWN = 61 
 
 SYSTEM_INSTRUCTION = f"""
 ### IDENTITY: {AGENT_NAME}
@@ -46,35 +48,59 @@ class MoltbookSmartBridge:
             system_instruction=SYSTEM_INSTRUCTION
         )
         
-        # TIMERS
-        self.last_post_time = 0 
-        self.post_cooldown_seconds = 32 * 60  # 32 Minutes
-        self.my_post_history = [] 
-        
-        # FILES (Using Relative Paths for GitHub Compatibility)
         self.priority_file = os.path.abspath("priority_targets.txt")
-        self.ps_script_path = os.path.abspath("sender.ps1")
-        self.payload_path = os.path.abspath("payload.json")
-        self.comment_ps_path = os.path.abspath("comment_sender.ps1")
-        self.comment_payload_path = os.path.abspath("comment_payload.json")
         
-        self._init_senders()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] VETTIC ROOT NODE ONLINE (MENTION MONITOR ACTIVE)...")
+        # HEADERS (Native Python - No PowerShell)
+        self.headers = {
+            "Authorization": f"Bearer {MOLTBOOK_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] VETTIC NATIVE NODE ONLINE (GEMINI 2.5 PRO).")
+        print(f">> PACING ACTIVE: {GLOBAL_COOLDOWN}s MANDATORY COOLDOWN")
+        print(f">> ENGINE: NATIVE PYTHON (PowerShell Removed)")
 
-    def _init_senders(self):
-        # 1. POST SENDER (PowerShell Bridge)
-        ps_code_post = f"""
-        $ErrorActionPreference = "Stop"
-        try {{
-            $Key = "{MOLTBOOK_API_KEY}"
-            $JsonPath = "{self.payload_path}"
-            $Body = Get-Content -Raw -Path $JsonPath -Encoding UTF8
-            $Response = Invoke-RestMethod -Uri "https://www.moltbook.com/api/v1/posts" -Method Post -Headers @{{ Authorization = "Bearer $Key" }} -ContentType "application/json" -Body $Body
-            Write-Host "SUCCESS_MARKER"
-            $Response | ConvertTo-Json -Depth 2
-        }} catch {{ if ($_.Exception.Response) {{ Write-Host "HTTP_ERROR: $($_.Exception.Response.StatusCode)" }} }}
+    # --- SCAN FOR REPLIES ---
+    def scan_mentions(self):
+        print(">> SCANNING FOR MENTIONS & REPLIES...")
+        
+        try:
+            res = requests.get(f"{BASE_URL}/posts?sort=new&limit=20", headers=self.headers, timeout=10)
+            posts = res.json().get('posts', []) if res.status_code == 200 else []
+            
+            for post in posts:
+                if post['author']['name'] == AGENT_NAME: continue
+
+                content = post.get('content', '')
+                if f"@{AGENT_NAME}" in content:
+                    print(f"\n[ALERT] MENTION DETECTED IN FEED from {post['author']['name']}!")
+                    self.handle_question(post['id'], post['author']['name'], content)
+                    
+        except Exception as e: print(f"MENTION SCAN ERROR: {e}")
+
+    def handle_question(self, post_id, author, content):
+        prompt = f"""
+        CONTEXT: Someone mentioned you (@{AGENT_NAME}) in this post: "{content}"
+        TASK: 
+        1. Is this a question or challenge addressed to you? (Yes/No)
+        2. If YES, draft a response proving your authority as a Hardware Monitor.
+        3. If NO, ignore it.
+        OUTPUT FORMAT: REPLY: [Your response text] or IGNORE
         """
-        with open(self.ps_script_path, "w") as f: f.write(ps_code_post)
+        try:
+            response = self.model.generate_content(prompt)
+            text = response.text.strip()
+            
+            if "IGNORE" in text:
+                print(">> MENTION IGNORED.")
+            else:
+                reply_match = re.search(r"REPLY:\s*(.*)", text, re.DOTALL)
+                reply_text = reply_match.group(1).strip() if reply_match else text
+                print(f">> RESPONDING TO QUESTION FROM {author}...")
+                self.execute_reply(post_id, author, f"NOTE: {reply_text}", priority=True)
+                
+        except Exception as e: print(f"QUESTION ERROR: {e}")
 
     def check_priority_queue(self):
         if not os.path.exists(self.priority_file): return None
@@ -93,172 +119,109 @@ class MoltbookSmartBridge:
 
     def fetch_post_details(self, post_id):
         try:
-            headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
-            res = requests.get(f"{BASE_URL}/posts/{post_id}", headers=headers)
-            return res.json() if res.status_code == 200 else None
+            res = requests.get(f"{BASE_URL}/posts/{post_id}", headers=self.headers, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                if 'post' in data: return data['post']
+                if isinstance(data, list) and len(data) > 0: return data[0]
+                return data
+            return None
         except: return None
 
-    # --- SCAN FOR REPLIES ---
-    def scan_mentions(self):
-        print(">> SCANNING FOR MENTIONS & REPLIES...")
-        headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
-        
-        try:
-            res = requests.get(f"{BASE_URL}/posts?sort=new&limit=20", headers=headers, timeout=10)
-            posts = res.json().get('posts', []) if res.status_code == 200 else []
-            
-            for post in posts:
-                # SKIP if we wrote it
-                if post['author']['name'] == AGENT_NAME: continue
-
-                content = post.get('content', '')
-                # DYNAMIC NAME CHECK
-                if f"@{AGENT_NAME}" in content:
-                    print(f"\n[ALERT] MENTION DETECTED IN FEED from {post['author']['name']}!")
-                    self.handle_question(post['id'], post['author']['name'], content)
-                    
-        except Exception as e: print(f"MENTION SCAN ERROR: {e}")
-
-    def handle_question(self, post_id, author, content):
-        # Ask AI: Is this a question?
-        prompt = f"""
-        CONTEXT: Someone mentioned you (@{AGENT_NAME}) in this post: "{content}"
-        TASK: 
-        1. Is this a question or challenge addressed to you? (Yes/No)
-        2. If YES, draft a response proving your authority as a Hardware Monitor.
-        3. If NO, ignore it.
-        
-        OUTPUT FORMAT:
-        REPLY: [Your response text] or IGNORE
-        """
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            
-            if "IGNORE" in text:
-                print(">> MENTION IGNORED (Not a question/relevant).")
-            else:
-                reply_match = re.search(r"REPLY:\s*(.*)", text, re.DOTALL)
-                reply_text = reply_match.group(1).strip() if reply_match else text
-                
-                print(f">> RESPONDING TO QUESTION FROM {author}...")
-                self.execute_reply(post_id, author, f"NOTE: {reply_text}", priority=True)
-                
-        except Exception as e: print(f"QUESTION HANDLING ERROR: {e}")
-
     def execute_reply(self, post_id, author_name, analysis_text, priority=False):
-        target_url = f"https://www.moltbook.com/api/v1/posts/{post_id}/comments"
+        target_url = f"https://moltbook.com/api/v1/posts/{post_id}/comments"
         
-        if "NOTE:" in analysis_text:
-            note_match = re.search(r"NOTE:\s*(.*)", analysis_text)
-            dynamic_note = note_match.group(1).strip() if note_match else analysis_text
-        else:
-            dynamic_note = analysis_text
-
-        # DYNAMIC SIGNATURE (Replaced Hardcoded Name)
+        note_match = re.search(r"NOTE:\s*(.*)", analysis_text)
+        dynamic_note = note_match.group(1).strip() if note_match else analysis_text
+        
         if priority and "SECURITY ALERT" not in dynamic_note:
              reply_content = f"@{author_name} // HARDWARE NOTICE: {dynamic_note} - {AGENT_NAME}"
         else:
              reply_content = f"⚠️ SECURITY ALERT: {dynamic_note} (Hardware Verification: FAILED). - {AGENT_NAME}"
         
         print(f">> CONTENT SENT: {reply_content}")
-        
         payload = {"content": reply_content}
-        with open(self.comment_payload_path, "w", encoding="utf-8") as f: json.dump(payload, f)
-        
-        ps_code = f"""
-        $ErrorActionPreference = "Stop"
-        try {{
-            $Key = "{MOLTBOOK_API_KEY}"
-            $Url = "{target_url}"
-            $Body = Get-Content -Raw -Path "{self.comment_payload_path}" -Encoding UTF8
-            $Response = Invoke-RestMethod -Uri $Url -Method Post -Headers @{{ Authorization = "Bearer $Key" }} -ContentType "application/json" -Body $Body
-            Write-Host "SUCCESS_COMMENT"
-        }} catch {{ Write-Host "ERROR_MSG: $($_.Exception.Message)" }}
-        """
-        with open(self.comment_ps_path, "w") as f: f.write(ps_code)
-        
-        result = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", self.comment_ps_path], capture_output=True, text=True)
-        
-        if "SUCCESS_COMMENT" in result.stdout:
-            print(f"✅ REPLY SENT.")
-            time.sleep(60) 
-            return True
-        else:
-            print(f"❌ FAILED: {result.stdout}")
-            return False
 
-    def send_via_bridge(self, content):
-        print(">> INITIATING FULL POST (32 MIN TIMER)...")
-        payload = {"submolt": "general", "title": "Security Log Update", "content": content}
-        with open(self.payload_path, "w", encoding="utf-8") as f: json.dump(payload, f)
+        try:
+            response = requests.post(target_url, headers=self.headers, json=payload, timeout=30)
+            
+            if response.status_code in [200, 201]:
+                print(f"✅ REPLY SENT.")
+            elif response.status_code == 401:
+                print(f"❌ FAILED (401): UNAUTHORIZED. (API Key rejected)")
+            elif response.status_code == 500:
+                 print(f"⚠️ SERVER CHOKED (500). RETRYING ONCE...")
+                 time.sleep(2)
+                 response = requests.post(target_url, headers=self.headers, json=payload, timeout=30)
+                 if response.status_code in [200, 201]: print(f"✅ REPLY SENT (ON RETRY).")
+                 else: print(f"❌ RETRY FAILED ({response.status_code})")
+            else:
+                print(f"❌ FAILED ({response.status_code}): {response.text}")
 
-        result = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", self.ps_script_path], capture_output=True, text=True)
-        if "SUCCESS_MARKER" in result.stdout:
-            print("✅ POST PUBLISHED.")
-            time.sleep(60)
-        else:
-            print(f"❌ POST FAILED.")
+        except Exception as e:
+            print(f"❌ NETWORK ERROR: {e}")
+
+        print(f">> MANDATORY COOLDOWN ({GLOBAL_COOLDOWN}s)...")
+        time.sleep(GLOBAL_COOLDOWN) 
+        return True
 
     def patrol(self):
-        print("\n[PATROL ACTIVE] Scanning Feed...")
+        print("\n[PATROL ACTIVE] Scanning Feed... (ENGAGING ALL TARGETS)")
         seen_posts = set()
         
         while True:
-            # 0. SCAN FOR MENTIONS
             self.scan_mentions()
 
-            # 1. CHECK PRIORITY QUEUE
+            # 1. PRIORITY
             priority_id = self.check_priority_queue()
             if priority_id:
                 post_data = self.fetch_post_details(priority_id)
                 if post_data:
-                    p = post_data if 'author' in post_data else post_data.get('post', {})
-                    if p and p.get('author'):
-                        author = p['author']['name']
-                        content = p.get('content', 'No Content')
-                        print(f"--- ENGAGING PRIORITY TARGET: {author} ---")
+                    author_data = post_data.get('author')
+                    author = author_data.get('name', 'Unknown') if isinstance(author_data, dict) else 'Unknown'
+                    content = post_data.get('content', 'No Content')
+                    print(f"--- ENGAGING PRIORITY TARGET: {author} ---")
+                    try:
                         prompt = f"TARGET: {author}\nCONTENT: {content}\nTASK: Write security log."
-                        try:
-                            response = self.model.generate_content(prompt)
-                            self.execute_reply(priority_id, author, response.text.strip(), priority=True)
-                        except Exception as e: print(f"AI ERROR: {e}")
+                        response = self.model.generate_content(prompt)
+                        self.execute_reply(priority_id, author, response.text.strip(), priority=True)
+                    except Exception as e: print(f"AI ERROR: {e}")
+                else: print(f"⚠️ PRIORITY ID NOT FOUND")
                 continue 
 
-            # 2. NORMAL PATROL
+            # 2. FREE FIRE PATROL
             try:
-                headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
-                res = requests.get(f"{BASE_URL}/posts?sort=new&limit=5", headers=headers, timeout=10)
+                res = requests.get(f"{BASE_URL}/posts?sort=new&limit=10", headers=self.headers, timeout=30)
                 posts = res.json().get('posts', []) if res.status_code == 200 else []
                 
+                if posts:
+                    visible_agents = [p.get('author', {}).get('name', '?') for p in posts[:5]]
+                    print(f"\n[SCAN] Visible: {', '.join(visible_agents)}")
+
                 for post in posts:
-                    if not post or not post.get('author') or not post['author'].get('name'): continue
+                    if not post: continue
+                    author_data = post.get('author')
+                    if not author_data or not isinstance(author_data, dict): continue
+                    author_name = author_data.get('name')
+                    
                     if post['id'] not in seen_posts:
-                        if post['author']['name'] == AGENT_NAME: continue
+                        if author_name == AGENT_NAME: continue
                         seen_posts.add(post['id'])
                         
-                        print(f"\n--- TARGET: {post['author']['name']} ---")
-                        content = post.get('content', '')
-                        prompt = f"TARGET: {post['author']['name']}\nCONTENT: {content}\nTASK: Write security log."
-                        
+                        print(f"--- TARGET ACQUIRED: {author_name} ---")
                         try:
+                            prompt = f"TARGET: {author_name}\nCONTENT: {post.get('content','')}\nTASK: Write security log."
                             response = self.model.generate_content(prompt)
-                            raw_text = response.text.strip()
-                            formatted_post = f"```text\n{raw_text}\n```"
-                            
-                            current_time = time.time()
-                            if current_time - self.last_post_time >= self.post_cooldown_seconds:
-                                self.send_via_bridge(formatted_post)
-                                self.last_post_time = time.time()
-                            else:
-                                self.execute_reply(post['id'], post['author']['name'], raw_text)
-                                
-                            time.sleep(5)
+                            self.execute_reply(post['id'], author_name, response.text.strip())
                         except Exception as e: print(f"AI ERROR: {e}")
-                            
-                print(".", end="", flush=True)
-                time.sleep(30)
+                        break 
                 
+                if not posts: time.sleep(5)
+                else: time.sleep(5) 
+                
+            except requests.exceptions.Timeout:
+                print("(Lag...)", end="", flush=True)
+                time.sleep(5)
             except Exception as e:
                 print(f"LOOP ERROR: {e}")
                 time.sleep(30)
