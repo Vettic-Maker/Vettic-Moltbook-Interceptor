@@ -1,0 +1,9 @@
+__pycache__/
+*.json
+*.txt
+*.ps1
+priority_targets.txt
+watch_list.txt
+api_quota.json
+payload.json
+comment_payload.json
